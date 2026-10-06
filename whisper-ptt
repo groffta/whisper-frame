@@ -206,12 +206,11 @@ def ensure_cues():
 class Beeper:
     """Play cues on a stream that is already running.
 
-    The default sink is the Babelfish Bluetooth headphones, and that sink
-    suspends after a few quiet seconds. A fresh 60ms pw-cat exits while the
-    headphones are still waking, so the beep is audible only when some other
-    stream has already woken them. A hold opens the stream early. The tone is
-    written once the sink is up, and the stream stays open long enough for the
-    Bluetooth buffer to drain.
+    The default playback sink suspends after a few quiet seconds. A fresh
+    short pw-cat exits while the sink is still waking, so the beep is audible
+    only when some other stream has already opened it. A hold opens the stream
+    early. The tone is written once the sink is up, and the stream stays open
+    long enough for the buffer to drain.
     """
 
     RATE = 48000

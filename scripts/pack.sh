@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assemble dist/whisper-frame-<version>-aarch64.tar.gz on this machine.
-# Uses the local Vulkan whisper.cpp build. Nothing is copied over SSH.
+# Uses the local Vulkan whisper.cpp build.
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
