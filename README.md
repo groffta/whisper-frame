@@ -25,7 +25,7 @@ Installed paths:
 
 ## Use
 
-Hold the headset Select button, or left-stick click, for about half a second. The beep means recording has started. Speak, then release. The transcript is typed into the focused window. A short click is left for Steam Input and does not beep.
+Hold the headset Select button, or left-stick click, for about a third of a second. The beep means recording has started. Speak, then release. The transcript is typed into the focused window. A short click is left for Steam Input and does not beep.
 
 `clear` and `submit` are commands when they are the whole transcript, or the first or last word.
 
@@ -45,7 +45,7 @@ threads=4
 append_space=yes
 enter=no
 min_ms=280
-arm_ms=500
+arm_ms=300
 max_ms=28000
 silence_rms=30
 ```

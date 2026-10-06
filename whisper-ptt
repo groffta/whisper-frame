@@ -99,7 +99,7 @@ append_space=yes
 enter=no
 min_ms=280
 # arm_ms: hold this long before the beep. A shorter click stays with Steam Input.
-arm_ms=500
+arm_ms=300
 max_ms=28000
 silence_rms=30
 """
@@ -128,7 +128,7 @@ def load_config():
         "append_space": True,
         "enter": False,
         "min_ms": 280,
-        "arm_ms": 500,
+        "arm_ms": 300,
         "max_ms": 28000,
         "silence_rms": 30,
     }
@@ -189,10 +189,10 @@ def write_tone(path, freq, ms, volume=0.18):
 def ensure_cues():
     STATE.mkdir(parents=True, exist_ok=True)
     cues = {
-        "start": (1320, 60),
-        "done": (880, 70),
-        "empty": (420, 110),
-        "error": (220, 160),
+        "start": (1320, 42),
+        "done": (880, 49),
+        "empty": (420, 77),
+        "error": (220, 112),
     }
     paths = {}
     for name, (freq, ms) in cues.items():
@@ -219,10 +219,10 @@ class Beeper:
         frames = self.RATE * 20 // 1000
         self.silence = bytes(frames * 4)
         self.cues = {
-            "start": self._tone(1320, 180, 0.50),
-            "done": self._tone(880, 150, 0.45),
-            "empty": self._tone(420, 180, 0.45),
-            "error": self._tone(220, 220, 0.50),
+            "start": self._tone(1320, 126, 0.50),
+            "done": self._tone(880, 105, 0.45),
+            "empty": self._tone(420, 126, 0.45),
+            "error": self._tone(220, 154, 0.50),
         }
         self.cv = threading.Condition()
         self.queue = []
