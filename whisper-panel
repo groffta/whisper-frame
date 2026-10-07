@@ -28,8 +28,11 @@ APP_OVERLAY = 2
 STANDING = 1
 MOUSE_INPUT = 1
 EVENT_SIZE = 60
+MOUSE_MOVE = 300
 MOUSE_DOWN = 301
 MOUSE_UP = 302
+FOCUS_ENTER = 303
+FOCUS_LEAVE = 304
 LEFT_BUTTON = 1
 VISIBLE_IN_DASHBOARD = 1 << 15
 SORT_WITH_NON_SCENE = 1 << 14
@@ -354,11 +357,16 @@ def _coverage(dist):
     return 0.5 - dist
 
 
-def mic_pixels(hot):
+def mic_pixels(face):
     """Rounded-rectangle mic button. Width is the overlay's meter width."""
     w, h = 120, 88
     radius = 18
-    bg = (176, 48, 52, 235) if hot else (32, 36, 42, 230)
+    if face == "hot":
+        bg = (176, 48, 52, 235)
+    elif face == "hover":
+        bg = (78, 86, 98, 240)
+    else:
+        bg = (32, 36, 42, 230)
     fg = (255, 255, 255, 255)
     buf = bytearray(w * h * 4)
 
@@ -410,7 +418,8 @@ class Button:
     def __init__(self, seq, handle):
         self.seq = seq
         self.handle = handle
-        self.hot = False
+        self.hovered = False
+        self.face = "idle"
         self.parent = 0
         self.placed = None
 
@@ -438,8 +447,9 @@ class Panel:
         self.set_input = fn(f, "set_input", ctypes.c_int, u64, ctypes.c_int)
         self.set_mouse_scale = fn(f, "set_mouse_scale", ctypes.c_int, u64, ctypes.POINTER(Vec2))
         self.set_raw = fn(f, "set_raw", ctypes.c_int, u64, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
-        self.tex_w, self.tex_h, self.idle_px = mic_pixels(False)
-        _, _, self.hot_px = mic_pixels(True)
+        self.tex_w, self.tex_h, self.idle_px = mic_pixels("idle")
+        _, _, self.hover_px = mic_pixels("hover")
+        _, _, self.hot_px = mic_pixels("hot")
         self.buttons = {}
         self.scales = WindowScale()
         self.holding = None
@@ -500,15 +510,15 @@ class Panel:
         self.set_mouse_scale(h, ctypes.byref(scale))
         self.set_flag(h, VISIBLE_IN_DASHBOARD, True)
         self.set_flag(h, SORT_WITH_NON_SCENE, True)
-        self.paint(h, False)
+        self.paint(h, "idle")
         self.show(h)
         button = Button(seq, h)
         self.buttons[seq] = button
         log(f"mic on gamescope window {seq}")
         return button
 
-    def paint(self, handle, hot):
-        pixels = self.hot_px if hot else self.idle_px
+    def paint(self, handle, face):
+        pixels = {"hot": self.hot_px, "hover": self.hover_px}[face] if face != "idle" else self.idle_px
         raw = ctypes.create_string_buffer(pixels)
         self.set_raw(handle, raw, self.tex_w, self.tex_h, 4)
 
@@ -644,15 +654,29 @@ class Panel:
             self.buf += data
         return None
 
-    def set_hot(self, button, hot):
-        if button.hot == hot:
+    def refresh(self, button):
+        if self.holding is button:
+            face = "hot"
+        elif button.hovered:
+            face = "hover"
+        else:
+            face = "idle"
+        if button.face == face:
             return
-        button.hot = hot
-        self.paint(button.handle, hot)
+        button.face = face
+        self.paint(button.handle, face)
 
     def pointer(self, button):
         while self.poll(button.handle, self.event, EVENT_SIZE):
             event_type = struct.unpack_from("<I", self.event, 0)[0]
+            if event_type in (MOUSE_MOVE, FOCUS_ENTER):
+                button.hovered = True
+                self.refresh(button)
+                continue
+            if event_type == FOCUS_LEAVE:
+                button.hovered = False
+                self.refresh(button)
+                continue
             if event_type not in (MOUSE_DOWN, MOUSE_UP):
                 if event_type and not self.odd_event:
                     log(f"overlay event {event_type}")
@@ -665,14 +689,14 @@ class Panel:
                 reply = self.send("hold")
                 if reply == "ok":
                     self.holding = button
-                    self.set_hot(button, True)
+                    self.refresh(button)
                     log("hold")
                 else:
                     log(f"hold {reply or 'no daemon'}")
             elif event_type == MOUSE_UP and self.holding is button:
                 self.send("release")
                 self.holding = None
-                self.set_hot(button, False)
+                self.refresh(button)
                 log("release")
 
     def retire(self, live):
