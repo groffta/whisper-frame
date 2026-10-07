@@ -6,11 +6,11 @@ This is a user-local install. SteamOS keeps the root filesystem read-only, and f
 
 ## Install
 
-Copy `whisper-frame-0.1.0-aarch64.tar.gz` to the Frame, then from a terminal in the desktop session:
+Copy `whisper-frame-0.2.0-aarch64.tar.gz` to the Frame, then from a terminal in the desktop session:
 
 ```sh
-tar -xzf whisper-frame-0.1.0-aarch64.tar.gz
-cd whisper-frame-0.1.0
+tar -xzf whisper-frame-0.2.0-aarch64.tar.gz
+cd whisper-frame-0.2.0
 ./install.sh
 ```
 
@@ -23,7 +23,7 @@ Installed paths:
 - `~/.local/share/whisper/ggml-small-q8_0.bin`
 - `~/.config/systemd/user/whisper-ptt.service`
 
-The 0.1.0 archive is the dictation daemon. It does not include the window mic. Installing from this repository does, when `whisper-panel` and `overlay_point.c` are in the directory: `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`. That adds:
+The 0.2.0 archive is the dictation daemon. It does not include the window mic. Installing from this repository does, when `whisper-panel` and `overlay_point.c` are in the directory: `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`. That adds:
 
 - `~/.local/bin/whisper-panel`
 - `~/.local/lib/whisper-frame/overlay_point.so`
