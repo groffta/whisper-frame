@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""A mic button that follows each Steam Frame floating window.
+
+The button is our own OpenVR overlay, parked just under the window's
+bottom-right corner, which is where the keyboard button sits on the
+control bar. Hold the trigger on it to dictate. Release types into the
+focused gamescope window. The headset Select button is unchanged.
+
+Needs overlay_point.so next to this file or in ~/.local/lib/whisper-frame.
+"""
+
+import base64
+import ctypes
+import json
+import math
+import os
+import socket
+import struct
+import threading
+import time
+from pathlib import Path
+
+HOME = Path.home()
+LIB = HOME / ".local/lib/whisper-frame"
+OPENVR = "/opt/steamvr/bin/linuxarm64/libopenvr_api.so"
+OVERLAY_VERSION = b"FnTable:IVROverlay_028"
+APP_OVERLAY = 2
+STANDING = 1
+MOUSE_INPUT = 1
+EVENT_SIZE = 60
+MOUSE_DOWN = 301
+MOUSE_UP = 302
+LEFT_BUTTON = 1
+VISIBLE_IN_DASHBOARD = 1 << 15
+SORT_WITH_NON_SCENE = 1 << 14
+# Overlay width. Height follows the texture, a rounded rectangle about
+# three quarters as tall, so the button is half the old 0.11 m disc.
+BUTTON_METERS = 0.055
+# Center of the button. One centimeter left of a flush right edge, and
+# this far down from the window's bottom edge.
+RIGHT_INSET = BUTTON_METERS / 2 + 0.01
+BELOW = 0.04
+TOWARD_VIEWER = 0.02
+SCAN_MAX = 4096
+SCENE_HOST = ("127.0.0.1", 27062)
+
+FN = {
+    "find": 0,
+    "create": 1,
+    "destroy": 3,
+    "set_flag": 11,
+    "set_color": 14,
+    "set_alpha": 16,
+    "set_sort": 20,
+    "set_width": 22,
+    "get_width": 23,
+    "set_absolute": 33,
+    "show": 43,
+    "hide": 44,
+    "visible": 45,
+    "coords": 46,
+    "wait_frame": 47,
+    "poll": 48,
+    "set_input": 50,
+    "get_mouse_scale": 51,
+    "set_mouse_scale": 52,
+    "set_raw": 62,
+}
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def control_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime) / "whisper-ptt.sock"
+
+
+class WindowScale:
+    """Live resize factor for each gamescope window.
+
+    The overlay quad OpenVR reports does not change when the user resizes
+    the window. The dashboard scene graph does: the panel scale grows from
+    the 0.369 basis. Dividing scale x/y by scale z is the factor on that quad.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._wanted = set()
+        self._factor = {}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def watch(self, seqs):
+        with self._lock:
+            self._wanted = set(seqs)
+
+    def factor(self, seq):
+        with self._lock:
+            return self._factor.get(seq, (1.0, 1.0))
+
+    def _run(self):
+        while True:
+            try:
+                self._session()
+            except Exception as exc:
+                log(f"window scale paused ({exc})")
+                time.sleep(1)
+
+    def _session(self):
+        sock = socket.create_connection(SCENE_HOST, 3)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock.sendall(
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.1:27062\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Origin: http://127.0.0.1:27062\r\n"
+                b"Sec-WebSocket-Key: " + key.encode() + b"\r\n"
+                b"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("scene graph closed during handshake")
+                buf += chunk
+            if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+                raise ConnectionError("scene graph refused the socket")
+            name = f"sgqueryservice/whisper-panel-{os.getpid()}"
+            self._send(sock, f"mailbox_open {name}")
+            sock.settimeout(0.02)
+            self._wsbuf = buf.split(b"\r\n\r\n", 1)[1]
+            message_id = 1
+            while True:
+                started = time.monotonic()
+                with self._lock:
+                    wanted = list(self._wanted)
+                for seq in wanted:
+                    panel = f"system.standalone::gamescope.gamescope-0.window.{seq}_Panel"
+                    body = {
+                        "type": "transform_request",
+                        "id": panel,
+                        "flPushDistance": 0,
+                        "timeoutSec": 0.05,
+                        "returnAddress": name,
+                        "message_id": message_id,
+                    }
+                    self._send(sock, "mailbox_send vrcompositor_systemlayer " + json.dumps(body))
+                    message_id += 1
+                got = 0
+                deadline = started + 0.04
+                while got < len(wanted) and time.monotonic() < deadline:
+                    frame = self._frame(sock)
+                    if frame is None:
+                        break
+                    if self._take(frame):
+                        got += 1
+                if not wanted:
+                    time.sleep(0.2)
+                    continue
+                # About 60 samples a second. Faster than that just queues mailbox traffic.
+                remain = 0.016 - (time.monotonic() - started)
+                if remain > 0:
+                    time.sleep(remain)
+        finally:
+            sock.close()
+
+    def _take(self, frame):
+        try:
+            data = json.loads(frame)
+        except json.JSONDecodeError:
+            return False
+        if data.get("type") != "transform_response":
+            return False
+        if data.get("error"):
+            return True
+        ident = str(data.get("id") or "")
+        seq = None
+        marker = "gamescope.gamescope-0.window."
+        if marker in ident and ident.endswith("_Panel"):
+            try:
+                seq = int(ident.split(marker, 1)[1].split("_", 1)[0])
+            except ValueError:
+                seq = None
+        scale = (data.get("transform") or {}).get("scale") or {}
+        sx, sy, sz = scale.get("x"), scale.get("y"), scale.get("z")
+        if seq is None or not sz or sz < 0.05 or not sx or not sy:
+            return True
+        factor = (sx / sz, sy / sz)
+        with self._lock:
+            previous = self._factor.get(seq)
+            self._factor[seq] = factor
+        if previous is None or abs(previous[0] - factor[0]) > 0.02 or abs(previous[1] - factor[1]) > 0.02:
+            log(f"window {seq} resize scale {factor[0]:.2f} x {factor[1]:.2f}")
+        return True
+
+    def _send(self, sock, text):
+        payload = text.encode()
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        n = len(payload)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header += n.to_bytes(2, "big")
+        else:
+            header.append(0x80 | 127)
+            header += n.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        sock.sendall(bytes(header) + mask + masked)
+
+    def _read(self, sock, n):
+        while len(self._wsbuf) < n:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                return None
+            if not chunk:
+                raise ConnectionError("scene graph closed")
+            self._wsbuf += chunk
+        out = self._wsbuf[:n]
+        self._wsbuf = self._wsbuf[n:]
+        return out
+
+    def _frame(self, sock):
+        while True:
+            hdr = self._read(sock, 2)
+            if hdr is None:
+                return None
+            opcode = hdr[0] & 0x0F
+            ln = hdr[1] & 0x7F
+            if ln == 126:
+                raw = self._read(sock, 2)
+                if raw is None:
+                    raise ConnectionError("short frame")
+                ln = int.from_bytes(raw, "big")
+            elif ln == 127:
+                raw = self._read(sock, 8)
+                if raw is None:
+                    raise ConnectionError("short frame")
+                ln = int.from_bytes(raw, "big")
+            mask = self._read(sock, 4) if hdr[1] & 0x80 else None
+            payload = self._read(sock, ln)
+            if payload is None:
+                raise ConnectionError("short frame")
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 1:
+                return payload.decode()
+            if opcode == 8:
+                raise ConnectionError("scene graph closed")
+
+
+class Vec2(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
+
+
+class Mat(ctypes.Structure):
+    _fields_ = [("m", ctypes.c_float * 12)]
+
+
+def load_openvr():
+    lib = ctypes.CDLL(OPENVR)
+    err = ctypes.c_int(0)
+    lib.VR_InitInternal.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    lib.VR_InitInternal.restype = ctypes.c_uint32
+    lib.VR_InitInternal(ctypes.byref(err), APP_OVERLAY)
+    if err.value != 0:
+        raise SystemExit(f"OpenVR init failed ({err.value})")
+    lib.VR_ShutdownInternal.argtypes = []
+    lib.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    lib.VR_GetGenericInterface.restype = ctypes.c_void_p
+    err = ctypes.c_int(0)
+    table = lib.VR_GetGenericInterface(OVERLAY_VERSION, ctypes.byref(err))
+    if err.value != 0 or not table:
+        lib.VR_ShutdownInternal()
+        raise SystemExit(f"IVROverlay_028 unavailable ({err.value})")
+    fns = ctypes.cast(table, ctypes.POINTER(ctypes.c_void_p))
+    glue_path = LIB / "overlay_point.so"
+    if not glue_path.exists():
+        glue_path = Path(__file__).resolve().parent / "overlay_point.so"
+    glue = ctypes.CDLL(str(glue_path))
+    glue.whisper_overlay_point.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.POINTER(Mat),
+    ]
+    glue.whisper_overlay_point.restype = ctypes.c_int
+    return lib, fns, glue
+
+
+def fn(fns, name, restype, *argtypes):
+    call = ctypes.CFUNCTYPE(restype, *argtypes)(fns[FN[name]])
+    return call
+
+
+def _coverage(dist):
+    if dist <= -1:
+        return 1.0
+    if dist >= 1:
+        return 0.0
+    return 0.5 - dist
+
+
+def mic_pixels(hot):
+    """Rounded-rectangle mic button. Width is the overlay's meter width."""
+    w, h = 120, 88
+    radius = 18
+    bg = (176, 48, 52, 235) if hot else (32, 36, 42, 230)
+    fg = (255, 255, 255, 255)
+    buf = bytearray(w * h * 4)
+
+    def over(x, y, color, cov):
+        if cov <= 0:
+            return
+        i = (y * w + x) * 4
+        src_a = color[3] / 255 * cov
+        dst_a = buf[i + 3] / 255
+        out_a = src_a + dst_a * (1 - src_a)
+        if out_a <= 0:
+            return
+        for channel in range(3):
+            src = color[channel] * src_a
+            dst = buf[i + channel] * dst_a * (1 - src_a)
+            buf[i + channel] = max(0, min(255, round((src + dst) / out_a)))
+        buf[i + 3] = max(0, min(255, round(out_a * 255)))
+
+    def rounded_rect(px, py, left, top, right, bottom, rad):
+        dx = abs(px - (left + right) / 2) - ((right - left) / 2 - rad)
+        dy = abs(py - (top + bottom) / 2) - ((bottom - top) / 2 - rad)
+        outside = math.hypot(max(dx, 0), max(dy, 0))
+        return outside + min(max(dx, dy), 0) - rad
+
+    def stadium(px, py, cx, top, bottom, rad):
+        # Distance to the capsule's center segment, then in by the radius.
+        clamped = min(max(py, top), bottom)
+        return math.hypot(px - cx, clamped - py) - rad
+
+    for y in range(h):
+        for x in range(w):
+            px = x + 0.5
+            py = y + 0.5
+            plate = _coverage(rounded_rect(px, py, 1, 1, w - 1, h - 1, radius))
+            if plate:
+                over(x, y, bg, plate)
+            # Capsule head, then the stem and the foot.
+            head = _coverage(stadium(px, py, 60, 24, 46, 8))
+            stem = _coverage(rounded_rect(px, py, 57.5, 46, 62.5, 58, 1.5))
+            foot = _coverage(rounded_rect(px, py, 46, 55, 74, 62, 3.5))
+            stand = _coverage(rounded_rect(px, py, 56, 62, 64, 70, 2))
+            ink = max(head, stem, foot, stand)
+            if ink:
+                over(x, y, fg, ink)
+    return w, h, bytes(buf)
+
+
+class Button:
+    def __init__(self, seq, handle):
+        self.seq = seq
+        self.handle = handle
+        self.hot = False
+        self.parent = 0
+        self.placed = None
+
+
+class Panel:
+    def __init__(self):
+        self.vr, self.fns, self.glue = load_openvr()
+        f = self.fns
+        u64 = ctypes.c_uint64
+        self.find = fn(f, "find", ctypes.c_int, ctypes.c_char_p, ctypes.POINTER(u64))
+        self.create = fn(f, "create", ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(u64))
+        self.destroy = fn(f, "destroy", ctypes.c_int, u64)
+        self.set_flag = fn(f, "set_flag", ctypes.c_int, u64, ctypes.c_int, ctypes.c_bool)
+        self.set_color = fn(f, "set_color", ctypes.c_int, u64, ctypes.c_float, ctypes.c_float, ctypes.c_float)
+        self.set_alpha = fn(f, "set_alpha", ctypes.c_int, u64, ctypes.c_float)
+        self.set_sort = fn(f, "set_sort", ctypes.c_int, u64, ctypes.c_uint32)
+        self.set_width = fn(f, "set_width", ctypes.c_int, u64, ctypes.c_float)
+        self.get_width = fn(f, "get_width", ctypes.c_int, u64, ctypes.POINTER(ctypes.c_float))
+        self.set_absolute = fn(f, "set_absolute", ctypes.c_int, u64, ctypes.c_int, ctypes.POINTER(Mat))
+        self.show = fn(f, "show", ctypes.c_int, u64)
+        self.hide = fn(f, "hide", ctypes.c_int, u64)
+        self.visible = fn(f, "visible", ctypes.c_bool, u64)
+        self.wait_frame = fn(f, "wait_frame", ctypes.c_int, ctypes.c_uint32)
+        self.poll = fn(f, "poll", ctypes.c_bool, u64, ctypes.c_void_p, ctypes.c_uint32)
+        self.set_input = fn(f, "set_input", ctypes.c_int, u64, ctypes.c_int)
+        self.set_mouse_scale = fn(f, "set_mouse_scale", ctypes.c_int, u64, ctypes.POINTER(Vec2))
+        self.set_raw = fn(f, "set_raw", ctypes.c_int, u64, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
+        self.tex_w, self.tex_h, self.idle_px = mic_pixels(False)
+        _, _, self.hot_px = mic_pixels(True)
+        self.buttons = {}
+        self.scales = WindowScale()
+        self.holding = None
+        self.sock = None
+        self.buf = b""
+        self.event = ctypes.create_string_buffer(EVENT_SIZE)
+        self.odd_event = False
+        self.get_mouse_scale = fn(
+            f, "get_mouse_scale", ctypes.c_int, u64, ctypes.POINTER(Vec2),
+        )
+
+    def shutdown(self):
+        for button in list(self.buttons.values()):
+            self.destroy(button.handle)
+        self.buttons.clear()
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+        self.vr.VR_ShutdownInternal()
+
+    def find_key(self, key):
+        handle = ctypes.c_uint64(0)
+        rc = self.find(key.encode(), ctypes.byref(handle))
+        if rc != 0:
+            return 0
+        return handle.value
+
+    def scan_windows(self):
+        found = []
+        for seq in range(1, SCAN_MAX + 1):
+            handle = self.find_key(f"gamescope.gamescope-0.window.{seq}")
+            if handle and self.visible(handle):
+                found.append((seq, handle))
+        return found
+
+    def ensure_button(self, seq):
+        button = self.buttons.get(seq)
+        if button is not None:
+            return button
+        handle = ctypes.c_uint64(0)
+        key = f"whisper-frame.mic.{seq}"
+        rc = self.create(key.encode(), b"Dictate", ctypes.byref(handle))
+        if rc == 17:
+            existing = self.find_key(key)
+            if not existing:
+                log(f"mic overlay {key} in use and not found ({rc})")
+                return None
+            handle = ctypes.c_uint64(existing)
+        elif rc != 0:
+            log(f"create mic overlay {key} failed ({rc})")
+            return None
+        h = handle.value
+        self.set_width(h, BUTTON_METERS)
+        self.set_alpha(h, 0.96)
+        self.set_sort(h, 80)
+        self.set_input(h, MOUSE_INPUT)
+        scale = Vec2(self.tex_w, self.tex_h)
+        self.set_mouse_scale(h, ctypes.byref(scale))
+        self.set_flag(h, VISIBLE_IN_DASHBOARD, True)
+        self.set_flag(h, SORT_WITH_NON_SCENE, True)
+        self.paint(h, False)
+        self.show(h)
+        button = Button(seq, h)
+        self.buttons[seq] = button
+        log(f"mic on gamescope window {seq}")
+        return button
+
+    def paint(self, handle, hot):
+        pixels = self.hot_px if hot else self.idle_px
+        raw = ctypes.create_string_buffer(pixels)
+        self.set_raw(handle, raw, self.tex_w, self.tex_h, 4)
+
+    def point(self, parent, x, y):
+        mat = Mat()
+        rc = self.glue.whisper_overlay_point(
+            self.fns[FN["coords"]], parent, STANDING, x, y, ctypes.byref(mat),
+        )
+        if rc != 0:
+            return None
+        return mat
+
+    def place(self, button, parent):
+        mouse = Vec2()
+        if self.get_mouse_scale(parent, ctypes.byref(mouse)) != 0 or mouse.x < 2:
+            return False
+        lower_left = self.point(parent, 0, 0)
+        lower_right = self.point(parent, mouse.x, 0)
+        upper_left = self.point(parent, 0, mouse.y)
+        if lower_left is None or lower_right is None or upper_left is None:
+            return False
+
+        def translation(spot):
+            return (spot.m[3], spot.m[7], spot.m[11])
+
+        left = translation(lower_left)
+        right_edge = translation(lower_right)
+        top = translation(upper_left)
+        right_vec = [right_edge[i] - left[i] for i in range(3)]
+        up_vec = [top[i] - left[i] for i in range(3)]
+        width = math.sqrt(sum(c * c for c in right_vec))
+        height = math.sqrt(sum(c * c for c in up_vec))
+        if width < 0.05 or height < 0.05:
+            return False
+        right_u = [c / width for c in right_vec]
+        up_u = [c / height for c in up_vec]
+        # Right × up points out the back of the glass. Toward the viewer is the opposite.
+        away = (
+            right_u[1] * up_u[2] - right_u[2] * up_u[1],
+            right_u[2] * up_u[0] - right_u[0] * up_u[2],
+            right_u[0] * up_u[1] - right_u[1] * up_u[0],
+        )
+        fx, fy = self.scales.factor(button.seq)
+        inset = min(RIGHT_INSET, width * fx * 0.35)
+        center = [left[i] + right_vec[i] / 2 + up_vec[i] / 2 for i in range(3)]
+        spot = lower_right
+        for row in range(3):
+            spot.m[3 + 4 * row] = (
+                center[row]
+                + right_u[row] * (width * fx / 2 - inset)
+                - up_u[row] * (height * fy / 2 + BELOW)
+                - away[row] * TOWARD_VIEWER
+            )
+            spot.m[row * 4 + 0] = right_u[row]
+            spot.m[row * 4 + 1] = up_u[row]
+            spot.m[row * 4 + 2] = away[row]
+        signature = (round(width * fx, 3), round(height * fy, 3))
+        if button.placed != signature:
+            log(
+                f"window {button.seq} {width * fx:.2f}x{height * fy:.2f}m, "
+                f"mic {inset:.2f}m in from the right edge"
+            )
+            button.placed = signature
+        rc = self.set_absolute(button.handle, STANDING, ctypes.byref(spot))
+        return rc == 0
+
+    def connect(self):
+        if self.sock is not None:
+            return True
+        path = control_path()
+        if not path.exists():
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(str(path))
+        except OSError:
+            sock.close()
+            return False
+        sock.setblocking(False)
+        self.sock = sock
+        self.buf = b""
+        log("connected to whisper-ptt")
+        return True
+
+    def send(self, line):
+        if not self.connect():
+            return None
+        try:
+            self.sock.sendall((line + "\n").encode())
+        except OSError:
+            self.sock.close()
+            self.sock = None
+            return None
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            if b"\n" in self.buf:
+                reply, _, rest = self.buf.partition(b"\n")
+                self.buf = rest
+                return reply.decode("ascii", "replace").strip()
+            try:
+                data = self.sock.recv(128)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            if not data:
+                self.sock.close()
+                self.sock = None
+                return None
+            self.buf += data
+        return None
+
+    def set_hot(self, button, hot):
+        if button.hot == hot:
+            return
+        button.hot = hot
+        self.paint(button.handle, hot)
+
+    def pointer(self, button):
+        while self.poll(button.handle, self.event, EVENT_SIZE):
+            event_type = struct.unpack_from("<I", self.event, 0)[0]
+            if event_type not in (MOUSE_DOWN, MOUSE_UP):
+                if event_type and not self.odd_event:
+                    log(f"overlay event {event_type}")
+                    self.odd_event = True
+                continue
+            button_bits = struct.unpack_from("<I", self.event, 20)[0]
+            if button_bits and not (button_bits & LEFT_BUTTON):
+                continue
+            if event_type == MOUSE_DOWN and self.holding is None:
+                reply = self.send("hold")
+                if reply == "ok":
+                    self.holding = button
+                    self.set_hot(button, True)
+                    log("hold")
+                else:
+                    log(f"hold {reply or 'no daemon'}")
+            elif event_type == MOUSE_UP and self.holding is button:
+                self.send("release")
+                self.holding = None
+                self.set_hot(button, False)
+                log("release")
+
+    def retire(self, live):
+        for seq in list(self.buttons):
+            if seq in live:
+                continue
+            button = self.buttons.pop(seq)
+            if self.holding is button:
+                self.send("release")
+                self.holding = None
+            self.hide(button.handle)
+            self.destroy(button.handle)
+            log(f"mic off window {seq}")
+
+    def run(self):
+        height_m = BUTTON_METERS * self.tex_h / self.tex_w
+        log(
+            f"whisper panel ready, mic {BUTTON_METERS:.3f}x{height_m:.3f}m, "
+            f"{RIGHT_INSET:.2f}m in from the right, {BELOW:.2f}m below"
+        )
+        next_scan = 0.0
+        windows = []
+        while True:
+            self.wait_frame(30)
+            now = time.monotonic()
+            if now >= next_scan:
+                windows = self.scan_windows()
+                next_scan = now + 1.5
+                self.retire({seq for seq, _ in windows})
+                self.scales.watch(seq for seq, _ in windows)
+            for seq, parent in windows:
+                button = self.ensure_button(seq)
+                if button is None:
+                    continue
+                button.parent = parent
+                if not self.place(button, parent):
+                    self.hide(button.handle)
+                    continue
+                self.show(button.handle)
+                self.pointer(button)
+
+
+def main():
+    panel = Panel()
+    try:
+        panel.run()
+    finally:
+        panel.shutdown()
+
+
+if __name__ == "__main__":
+    main()

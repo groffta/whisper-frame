@@ -25,6 +25,11 @@ mkdir -p "$LIB" "$BINDIR" "$SHARE" "$UNIT_DIR"
 cp -a "$ROOT/lib/." "$LIB/"
 install -m 755 "$ROOT/whisper-ptt" "$BINDIR/whisper-ptt"
 install -m 644 "$ROOT/whisper-ptt.service" "$UNIT_DIR/whisper-ptt.service"
+if [ -f "$ROOT/whisper-panel" ] && [ -f "$ROOT/overlay_point.c" ]; then
+    install -m 755 "$ROOT/whisper-panel" "$BINDIR/whisper-panel"
+    install -m 644 "$ROOT/whisper-panel.service" "$UNIT_DIR/whisper-panel.service"
+    gcc -shared -fPIC -O2 -o "$LIB/overlay_point.so" "$ROOT/overlay_point.c"
+fi
 chmod 755 "$LIB/whisper-cli"
 
 have=0
@@ -53,5 +58,9 @@ fi
 systemctl --user daemon-reload
 systemctl --user enable whisper-ptt
 systemctl --user restart whisper-ptt
+if [ -f "$UNIT_DIR/whisper-panel.service" ]; then
+    systemctl --user enable whisper-panel
+    systemctl --user restart whisper-panel
+fi
 systemctl --user --no-pager --full status whisper-ptt
-echo "Installed. Hold Select or left-stick click until the beep."
+echo "Installed. Hold Select until the beep, or hold the mic under a floating window."

@@ -1,0 +1,16 @@
+[Unit]
+Description=Whisper dictation button on floating windows
+After=whisper-ptt.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whisper-panel
+Restart=on-failure
+RestartSec=2
+Nice=5
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

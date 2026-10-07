@@ -3,8 +3,8 @@
 
 A short click of the headset Select button is left for Steam Input.
 Hold it until the beep, then speak, then release. The words are typed
-into whatever gamescope has focused. Left-stick click works the same
-way when Steam is presenting the virtual gamepad.
+into whatever gamescope has focused. Y on the right controller works
+the same way when that button is reaching the virtual gamepad.
 
 "clear" and "submit" are actions when they are the whole transcript or
 the first or last word. Clear selects all and backspaces. Submit presses
@@ -21,6 +21,7 @@ import os
 import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -63,6 +64,8 @@ GAMEPAD_BUTTONS = {
     "l3": BTN_THUMBL,
     "r3": 318,
 }
+CODE_NAMES = {code: name for name, code in GAMEPAD_BUTTONS.items()}
+CODE_NAMES[KEY_SELECT] = "select"
 
 # Silence hallucinations whisper emits on a quiet clip. Real one-word
 # answers ("yes", "okay") are kept when the recording is loud enough.
@@ -91,7 +94,9 @@ QUIET_DROP = {"you", "thank you", "thanks", "bye", "hmm", "uh", "um", "so", "oka
 
 DEFAULT_CONF = """\
 # Whisper small push-to-talk
-# button: both, select, l3, or a gamepad name (a b x y lb rb view menu guide r3)
+# button: both, select, y, or a gamepad name (a b x y lb rb view menu guide l3 r3)
+# both is the headset Select button plus Y. Left-stick click is the
+# pointer's right click, and the desktop config does not pass it through.
 button=both
 language=en
 threads=4
@@ -151,7 +156,7 @@ def wanted_codes(button):
     """Return (watch_select, gamepad_codes)."""
     parts = re.split(r"[+, ]+", button.strip().lower())
     if parts == ["both"]:
-        parts = ["select", "l3"]
+        parts = ["select", "y"]
     select = False
     codes = set()
     for part in parts:
@@ -1056,6 +1061,116 @@ def fd_alive(fd):
         return False
 
 
+def control_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime) / "whisper-ptt.sock"
+
+
+class PanelControl:
+    """Unix socket the floating-window mic panel uses to hold and release.
+
+    A line is "hold" or "release". Hold starts recording immediately.
+    The headset button still has to pass arm_ms, and it does not steal
+    a take the panel already owns.
+    """
+
+    def __init__(self):
+        path = control_path()
+        path.unlink(missing_ok=True)
+        listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listen.bind(str(path))
+        os.chmod(path, 0o600)
+        listen.listen(2)
+        listen.setblocking(False)
+        self.path = path
+        self.listen = listen
+        self.clients = {}
+        self.owner = False
+        self.holder = None
+        log(f"panel socket {path}")
+
+    def sockets(self):
+        return [self.listen, *self.clients]
+
+    def close(self):
+        for conn in list(self.clients):
+            self._drop(conn)
+        try:
+            self.listen.close()
+        except OSError:
+            pass
+        self.path.unlink(missing_ok=True)
+
+    def _drop(self, conn):
+        self.clients.pop(conn, None)
+        if conn is self.holder:
+            self.holder = None
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _send(self, conn, data):
+        try:
+            conn.sendall(data)
+        except OSError:
+            self._drop(conn)
+
+    def accept_ready(self):
+        while True:
+            try:
+                conn, _ = self.listen.accept()
+            except BlockingIOError:
+                return
+            conn.setblocking(False)
+            self.clients[conn] = bytearray()
+
+    def read_ready(self, conn, talker):
+        """Return True when this client released a panel take by hanging up."""
+        try:
+            data = conn.recv(512)
+        except BlockingIOError:
+            return False
+        if not data:
+            held = conn is self.holder and self.owner
+            self._drop(conn)
+            if held:
+                self.owner = False
+                log("panel hangup")
+                talker.stop(discard=False)
+            return held
+        buf = self.clients.get(conn)
+        if buf is None:
+            return False
+        buf.extend(data)
+        while b"\n" in buf:
+            line, _, rest = buf.partition(b"\n")
+            del buf[: len(line) + 1]
+            self._command(conn, line.decode("ascii", "replace").strip(), talker)
+        return False
+
+    def _command(self, conn, line, talker):
+        if line == "hold":
+            if self.owner or talker.recording() or talker.busy:
+                self._send(conn, b"busy\n")
+                return
+            self.owner = True
+            self.holder = conn
+            talker.start()
+            log("panel hold")
+            self._send(conn, b"ok\n")
+            return
+        if line == "release":
+            if self.owner and conn is self.holder:
+                self.owner = False
+                self.holder = None
+                log("panel release")
+                talker.stop(discard=False)
+            self._send(conn, b"ok\n")
+            return
+        self._send(conn, b"no\n")
+
+
 def run_daemon():
     if not BIN.exists() or not MODEL.exists():
         raise SystemExit(f"missing {BIN} or {MODEL}")
@@ -1082,6 +1197,7 @@ def run_daemon():
     pending_at = 0.0
     starter = None
     signature = None
+    panel = PanelControl()
 
     def rescan(force=False):
         nonlocal fds, signature, starter, held, pending, pending_at
@@ -1094,6 +1210,8 @@ def run_daemon():
             starter = None
             held = set()
             pending = None
+            panel.owner = False
+            panel.holder = None
             talker.stop(discard=False)
         else:
             beeper.end()
@@ -1108,13 +1226,13 @@ def run_daemon():
 
     def arm_pending():
         nonlocal pending, starter
-        if pending is None or starter is not None or talker.recording() or talker.busy:
+        if panel.owner or pending is None or starter is not None or talker.recording() or talker.busy:
             return
         if (time.monotonic() - pending_at) * 1000 < cfg["arm_ms"]:
             return
         starter = pending
         pending = None
-        log(f"long press {cfg['arm_ms']}ms")
+        log(f"long press {CODE_NAMES.get(starter[1], starter[1])} {cfg['arm_ms']}ms")
         talker.start()
 
     rescan(force=True)
@@ -1124,8 +1242,18 @@ def run_daemon():
         if pending is not None and not talker.busy:
             remain = (cfg["arm_ms"] / 1000) - (time.monotonic() - pending_at)
             timeout = 0 if remain <= 0 else min(timeout, max(0.02, remain))
-        readable, _, _ = select.select(list(fds), [], [], timeout)
+        sockets = {sock.fileno(): sock for sock in panel.sockets()}
+        readable, _, _ = select.select(list(fds) + list(sockets), [], [], timeout)
         for fd in readable:
+            sock = sockets.get(fd)
+            if sock is not None:
+                if sock is panel.listen:
+                    panel.accept_ready()
+                else:
+                    panel.read_ready(sock, talker)
+                if panel.owner and pending is not None:
+                    pending = None
+                continue
             events = read_keys(fd)
             if events is None:
                 if pending and pending[0] == fd:
@@ -1146,7 +1274,13 @@ def run_daemon():
                 token = (fd, code)
                 if value == 1:
                     held.add(token)
-                    if starter is None and pending is None and not talker.busy:
+                    if (
+                        starter is None
+                        and pending is None
+                        and not talker.busy
+                        and not panel.owner
+                        and not talker.recording()
+                    ):
                         pending = token
                         pending_at = time.monotonic()
                         beeper.begin()
@@ -1155,7 +1289,7 @@ def run_daemon():
                     if token == pending:
                         pending = None
                         beeper.end()
-                        log("short click")
+                        log(f"short click {CODE_NAMES.get(code, code)}")
                     elif token == starter:
                         short = (time.monotonic() - talker.started) * 1000 < cfg["min_ms"]
                         starter = None
@@ -1165,6 +1299,8 @@ def run_daemon():
             log("max length, transcribing")
             starter = None
             pending = None
+            panel.owner = False
+            panel.holder = None
             talker.stop(discard=False)
             held.clear()
 
