@@ -33,19 +33,25 @@ MOUSE_DOWN = 301
 MOUSE_UP = 302
 FOCUS_ENTER = 303
 FOCUS_LEAVE = 304
+# A press shorter than this toggles recording and leaves it running.
+# A longer press is hold-to-talk: release types the transcript.
+CLICK_S = 0.30
 LEFT_BUTTON = 1
 VISIBLE_IN_DASHBOARD = 1 << 15
 SORT_WITH_NON_SCENE = 1 << 14
-# Overlay width. Height follows the texture, a rounded rectangle about
-# three quarters as tall, so the button is half the old 0.11 m disc.
-BUTTON_METERS = 0.055
+# Overlay width. The texture is 5:3, so the plate is 5 cm by 3 cm.
+BUTTON_METERS = 0.05
+# Resize eases the corner toward the latest sample. Kept short so the
+# button stays with the glass. A window drag is not eased: that motion
+# is shared with the window center.
+SMOOTH_S = 0.03
 # Center of the button. Two centimeters left of a flush right edge, and
 # this far down from the window's bottom edge.
 RIGHT_INSET = BUTTON_METERS / 2 + 0.02
 BELOW = 0.03
 # Meters toward the viewer along the anchor Z axis. That axis points at
 # the viewer; an earlier minus sign pushed the button into the glass.
-TOWARD_VIEWER = 0.02
+TOWARD_VIEWER = 0.005
 SCAN_MAX = 4096
 SCENE_HOST = ("127.0.0.1", 27062)
 
@@ -95,6 +101,7 @@ class WindowScale:
         self._wanted = set()
         self._factor = {}
         self._pose = {}
+        self._center = {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -110,6 +117,10 @@ class WindowScale:
         """Bottom-right corner of the window, already bent by curvature."""
         with self._lock:
             return self._pose.get(seq)
+
+    def center(self, seq):
+        with self._lock:
+            return self._center.get(seq)
 
     def _run(self):
         while True:
@@ -214,6 +225,11 @@ class WindowScale:
             return True
         if not ident.endswith("_Panel"):
             return True
+        translation = transform.get("translation") or {}
+        cx, cy, cz = translation.get("x"), translation.get("y"), translation.get("z")
+        if cx is not None and cy is not None and cz is not None:
+            with self._lock:
+                self._center[seq] = (cx, cy, cz)
         scale = transform.get("scale") or {}
         sx, sy, sz = scale.get("x"), scale.get("y"), scale.get("z")
         if not sz or sz < 0.05 or not sx or not sy:
@@ -354,36 +370,15 @@ def _coverage(dist):
         return 1.0
     if dist >= 1:
         return 0.0
-    return 0.5 - dist
+    return max(0.0, min(1.0, 0.5 - dist))
 
 
-def mic_pixels(face):
-    """Rounded-rectangle mic button. Width is the overlay's meter width."""
-    w, h = 120, 88
-    radius = 18
-    if face == "hot":
-        bg = (176, 48, 52, 235)
-    elif face == "hover":
-        bg = (78, 86, 98, 240)
-    else:
-        bg = (32, 36, 42, 230)
-    fg = (255, 255, 255, 255)
-    buf = bytearray(w * h * 4)
-
-    def over(x, y, color, cov):
-        if cov <= 0:
-            return
-        i = (y * w + x) * 4
-        src_a = color[3] / 255 * cov
-        dst_a = buf[i + 3] / 255
-        out_a = src_a + dst_a * (1 - src_a)
-        if out_a <= 0:
-            return
-        for channel in range(3):
-            src = color[channel] * src_a
-            dst = buf[i + channel] * dst_a * (1 - src_a)
-            buf[i + channel] = max(0, min(255, round((src + dst) / out_a)))
-        buf[i + 3] = max(0, min(255, round(out_a * 255)))
+def _masks():
+    """Plate and ink coverage for the mic texture."""
+    w, h = 150, 90
+    radius = 20
+    plate = bytearray(w * h)
+    ink = bytearray(w * h)
 
     def rounded_rect(px, py, left, top, right, bottom, rad):
         dx = abs(px - (left + right) / 2) - ((right - left) / 2 - rad)
@@ -392,7 +387,6 @@ def mic_pixels(face):
         return outside + min(max(dx, dy), 0) - rad
 
     def stadium(px, py, cx, top, bottom, rad):
-        # Distance to the capsule's center segment, then in by the radius.
         clamped = min(max(py, top), bottom)
         return math.hypot(px - cx, clamped - py) - rad
 
@@ -400,18 +394,49 @@ def mic_pixels(face):
         for x in range(w):
             px = x + 0.5
             py = y + 0.5
-            plate = _coverage(rounded_rect(px, py, 1, 1, w - 1, h - 1, radius))
-            if plate:
-                over(x, y, bg, plate)
-            # Capsule head, then the stem and the foot.
-            head = _coverage(stadium(px, py, 60, 24, 46, 8))
-            stem = _coverage(rounded_rect(px, py, 57.5, 46, 62.5, 58, 1.5))
-            foot = _coverage(rounded_rect(px, py, 46, 55, 74, 62, 3.5))
-            stand = _coverage(rounded_rect(px, py, 56, 62, 64, 70, 2))
-            ink = max(head, stem, foot, stand)
-            if ink:
-                over(x, y, fg, ink)
-    return w, h, bytes(buf)
+            cover = _coverage(rounded_rect(px, py, 1, 1, w - 1, h - 1, radius))
+            head = _coverage(stadium(px, py, 75, 25, 47, 8))
+            stem = _coverage(rounded_rect(px, py, 72.5, 47, 77.5, 59, 1.5))
+            foot = _coverage(rounded_rect(px, py, 61, 56, 89, 63, 3.5))
+            stand = _coverage(rounded_rect(px, py, 71, 63, 79, 71, 2))
+            mark = max(head, stem, foot, stand)
+            i = y * w + x
+            plate[i] = round(cover * 255)
+            ink[i] = round(mark * 255)
+    return w, h, plate, ink
+
+
+def _compose(plate, ink, color):
+    w = 150
+    buf = bytearray(len(plate) * 4)
+    cr, cg, cb, ca = color
+    for i, (cover, mark) in enumerate(zip(plate, ink)):
+        if cover == 0 and mark == 0:
+            continue
+        o = i * 4
+        src_a = ca / 255 * cover / 255
+        buf[o] = cr
+        buf[o + 1] = cg
+        buf[o + 2] = cb
+        buf[o + 3] = round(src_a * 255)
+        if mark == 0:
+            continue
+        ink_a = mark / 255
+        out_a = ink_a + src_a * (1 - ink_a)
+        if out_a <= 0:
+            continue
+        for channel in range(3):
+            src = 255 * ink_a
+            dst = buf[o + channel] * src_a * (1 - ink_a)
+            buf[o + channel] = max(0, min(255, round((src + dst) / out_a)))
+        buf[o + 3] = round(out_a * 255)
+    return bytes(buf)
+
+
+# Plate alpha sits a little under the old solid fill.
+IDLE_BG = (50, 56, 64, 210)
+HOVER_BG = (84, 94, 108, 220)
+HOT_BG = (176, 48, 52, 214)
 
 
 class Button:
@@ -420,6 +445,8 @@ class Button:
         self.handle = handle
         self.hovered = False
         self.face = "idle"
+        self.offset = None
+        self.smooth_at = None
         self.parent = 0
         self.placed = None
 
@@ -447,12 +474,15 @@ class Panel:
         self.set_input = fn(f, "set_input", ctypes.c_int, u64, ctypes.c_int)
         self.set_mouse_scale = fn(f, "set_mouse_scale", ctypes.c_int, u64, ctypes.POINTER(Vec2))
         self.set_raw = fn(f, "set_raw", ctypes.c_int, u64, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
-        self.tex_w, self.tex_h, self.idle_px = mic_pixels("idle")
-        _, _, self.hover_px = mic_pixels("hover")
-        _, _, self.hot_px = mic_pixels("hot")
+        self.tex_w, self.tex_h, plate, ink = _masks()
+        self.idle_px = _compose(plate, ink, IDLE_BG)
+        self.hover_px = _compose(plate, ink, HOVER_BG)
+        self.hot_px = _compose(plate, ink, HOT_BG)
         self.buttons = {}
         self.scales = WindowScale()
         self.holding = None
+        self.latched = False
+        self.pressed_at = 0.0
         self.sock = None
         self.buf = b""
         self.event = ctypes.create_string_buffer(EVENT_SIZE)
@@ -503,24 +533,35 @@ class Panel:
             return None
         h = handle.value
         self.set_width(h, BUTTON_METERS)
-        self.set_alpha(h, 0.96)
+        self.set_alpha(h, 0.88)
         self.set_sort(h, 80)
         self.set_input(h, MOUSE_INPUT)
         scale = Vec2(self.tex_w, self.tex_h)
         self.set_mouse_scale(h, ctypes.byref(scale))
         self.set_flag(h, VISIBLE_IN_DASHBOARD, True)
         self.set_flag(h, SORT_WITH_NON_SCENE, True)
-        self.paint(h, "idle")
+        self.paint(h, self.idle_px)
         self.show(h)
         button = Button(seq, h)
         self.buttons[seq] = button
         log(f"mic on gamescope window {seq}")
         return button
 
-    def paint(self, handle, face):
-        pixels = {"hot": self.hot_px, "hover": self.hover_px}[face] if face != "idle" else self.idle_px
+    def paint(self, handle, pixels):
         raw = ctypes.create_string_buffer(pixels)
         self.set_raw(handle, raw, self.tex_w, self.tex_h, 4)
+
+    def refresh(self, button):
+        if self.holding is button:
+            face, pixels = "hot", self.hot_px
+        elif button.hovered:
+            face, pixels = "hover", self.hover_px
+        else:
+            face, pixels = "idle", self.idle_px
+        if button.face == face:
+            return
+        button.face = face
+        self.paint(button.handle, pixels)
 
     def point(self, parent, x, y):
         mat = Mat()
@@ -531,10 +572,10 @@ class Panel:
             return None
         return mat
 
-    def place(self, button, parent):
+    def place(self, button, parent, now):
         pose = self.scales.pose(button.seq)
         if pose is not None:
-            return self.place_on_corner(button, pose)
+            return self.place_on_corner(button, pose, now)
         mouse = Vec2()
         if self.get_mouse_scale(parent, ctypes.byref(mouse)) != 0 or mouse.x < 2:
             return False
@@ -568,13 +609,16 @@ class Panel:
         inset = min(RIGHT_INSET, width * fx * 0.35)
         center = [left[i] + right_vec[i] / 2 + up_vec[i] / 2 for i in range(3)]
         spot = lower_right
+        target = [
+            center[row]
+            + right_u[row] * (width * fx / 2 - inset)
+            - up_u[row] * (height * fy / 2 + BELOW)
+            + facing[row] * TOWARD_VIEWER
+            for row in range(3)
+        ]
+        shown = self.smooth_point(button, center, target, now)
         for row in range(3):
-            spot.m[3 + 4 * row] = (
-                center[row]
-                + right_u[row] * (width * fx / 2 - inset)
-                - up_u[row] * (height * fy / 2 + BELOW)
-                + facing[row] * TOWARD_VIEWER
-            )
+            spot.m[3 + 4 * row] = shown[row]
             spot.m[row * 4 + 0] = right_u[row]
             spot.m[row * 4 + 1] = up_u[row]
             spot.m[row * 4 + 2] = facing[row]
@@ -588,21 +632,44 @@ class Panel:
         rc = self.set_absolute(button.handle, STANDING, ctypes.byref(spot))
         return rc == 0
 
-    def place_on_corner(self, button, pose):
+    def smooth_point(self, button, center, target, now):
+        """Ease the corner offset. The window center is applied unsmoothed."""
+        if center is None:
+            return target
+        offset = tuple(target[i] - center[i] for i in range(3))
+        if button.offset is None or button.smooth_at is None:
+            button.offset = offset
+            button.smooth_at = now
+            return target
+        dt = min(0.05, max(0.0, now - button.smooth_at))
+        button.smooth_at = now
+        gap = math.sqrt(sum((offset[i] - button.offset[i]) ** 2 for i in range(3)))
+        if gap > 0.35:
+            button.offset = offset
+        else:
+            alpha = 1.0 - math.exp(-dt / SMOOTH_S) if dt else 1.0
+            button.offset = tuple(
+                button.offset[i] + (offset[i] - button.offset[i]) * alpha for i in range(3)
+            )
+        return tuple(center[i] + button.offset[i] for i in range(3))
+
+    def place_on_corner(self, button, pose, now):
         tx, ty, tz, qx, qy, qz, qw = pose
         right, up, facing = quat_basis(qx, qy, qz, qw)
-        origin = (tx, ty, tz)
+        target = tuple(
+            (tx, ty, tz)[row]
+            - right[row] * RIGHT_INSET
+            - up[row] * BELOW
+            + facing[row] * TOWARD_VIEWER
+            for row in range(3)
+        )
+        shown = self.smooth_point(button, self.scales.center(button.seq), target, now)
         spot = Mat()
         for row in range(3):
             spot.m[row * 4 + 0] = right[row]
             spot.m[row * 4 + 1] = up[row]
             spot.m[row * 4 + 2] = facing[row]
-            spot.m[3 + 4 * row] = (
-                origin[row]
-                - right[row] * RIGHT_INSET
-                - up[row] * BELOW
-                + facing[row] * TOWARD_VIEWER
-            )
+            spot.m[3 + 4 * row] = shown[row]
         if button.placed != "corner":
             log(f"window {button.seq} mic on the window corner")
             button.placed = "corner"
@@ -654,18 +721,6 @@ class Panel:
             self.buf += data
         return None
 
-    def refresh(self, button):
-        if self.holding is button:
-            face = "hot"
-        elif button.hovered:
-            face = "hover"
-        else:
-            face = "idle"
-        if button.face == face:
-            return
-        button.face = face
-        self.paint(button.handle, face)
-
     def pointer(self, button):
         while self.poll(button.handle, self.event, EVENT_SIZE):
             event_type = struct.unpack_from("<I", self.event, 0)[0]
@@ -685,19 +740,35 @@ class Panel:
             button_bits = struct.unpack_from("<I", self.event, 20)[0]
             if button_bits and not (button_bits & LEFT_BUTTON):
                 continue
+            if event_type == MOUSE_DOWN and self.latched:
+                previous = self.holding
+                self.send("release")
+                self.holding = None
+                self.latched = False
+                if previous is not None:
+                    self.refresh(previous)
+                if previous is not button:
+                    self.refresh(button)
+                log("click off")
+                continue
             if event_type == MOUSE_DOWN and self.holding is None:
                 reply = self.send("hold")
                 if reply == "ok":
                     self.holding = button
+                    self.pressed_at = time.monotonic()
                     self.refresh(button)
                     log("hold")
                 else:
                     log(f"hold {reply or 'no daemon'}")
-            elif event_type == MOUSE_UP and self.holding is button:
-                self.send("release")
-                self.holding = None
-                self.refresh(button)
-                log("release")
+            elif event_type == MOUSE_UP and self.holding is button and not self.latched:
+                if time.monotonic() - self.pressed_at < CLICK_S:
+                    self.latched = True
+                    log("click on")
+                else:
+                    self.send("release")
+                    self.holding = None
+                    self.refresh(button)
+                    log("release")
 
     def retire(self, live):
         for seq in list(self.buttons):
@@ -707,6 +778,7 @@ class Panel:
             if self.holding is button:
                 self.send("release")
                 self.holding = None
+                self.latched = False
             self.hide(button.handle)
             self.destroy(button.handle)
             log(f"mic off window {seq}")
@@ -732,7 +804,7 @@ class Panel:
                 if button is None:
                     continue
                 button.parent = parent
-                if not self.place(button, parent):
+                if not self.place(button, parent, now):
                     self.hide(button.handle)
                     continue
                 self.show(button.handle)
