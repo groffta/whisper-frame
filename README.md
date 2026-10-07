@@ -23,7 +23,7 @@ Installed paths:
 - `~/.local/share/whisper/ggml-small-q8_0.bin`
 - `~/.config/systemd/user/whisper-ptt.service`
 
-The 0.2.0 archive is the dictation daemon. It does not include the window mic. Installing from this repository does, when `whisper-panel` and `overlay_point.c` are in the directory: `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`. That adds:
+The archive includes the window mic. `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`. That adds:
 
 - `~/.local/bin/whisper-panel`
 - `~/.local/lib/whisper-frame/overlay_point.so`

@@ -8,7 +8,7 @@
 - `clear` backspaces the characters whisper typed, one for each, instead of selecting the whole field. `submit` presses Enter and drops that buffer.
 - The mic eases with the window when it is dragged or resized. Both eases are 10 ms. A move past 0.35 m snaps.
 - The dictation service reopens its display after the X server restarts. The mic panel starts again when SteamVR restarts.
-- The release archive is still the dictation daemon. Installing from this repository also builds the window mic when `whisper-panel` and `overlay_point.c` are present.
+- The release archive includes the window mic. `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`.
 
 ## 0.1.0 - 2026-10-05
 
