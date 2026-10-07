@@ -3,8 +3,8 @@
 
 A short click of the headset Select button is left for Steam Input.
 Hold it until the beep, then speak, then release. The words are typed
-into whatever gamescope has focused. Y on the right controller works
-the same way when that button is reaching the virtual gamepad.
+into whatever gamescope has focused. The mic on a floating window
+starts immediately. Controller buttons are not triggers.
 
 "clear" and "submit" are actions when they are the whole transcript or
 the first or last word. Clear selects all and backspaces. Submit presses
@@ -94,10 +94,9 @@ QUIET_DROP = {"you", "thank you", "thanks", "bye", "hmm", "uh", "um", "so", "oka
 
 DEFAULT_CONF = """\
 # Whisper small push-to-talk
-# button: both, select, y, or a gamepad name (a b x y lb rb view menu guide l3 r3)
-# both is the headset Select button plus Y. Left-stick click is the
-# pointer's right click, and the desktop config does not pass it through.
-button=both
+# button: select. The mic on a floating window is the other trigger.
+# both is accepted and means select. A gamepad name still works if set.
+button=select
 language=en
 threads=4
 append_space=yes
@@ -127,7 +126,7 @@ def load_config():
     if not CONF.exists():
         CONF.write_text(DEFAULT_CONF)
     cfg = {
-        "button": "both",
+        "button": "select",
         "language": "en",
         "threads": 4,
         "append_space": True,
@@ -156,7 +155,7 @@ def wanted_codes(button):
     """Return (watch_select, gamepad_codes)."""
     parts = re.split(r"[+, ]+", button.strip().lower())
     if parts == ["both"]:
-        parts = ["select", "y"]
+        parts = ["select"]
     select = False
     codes = set()
     for part in parts:

@@ -25,9 +25,9 @@ Installed paths:
 
 ## Use
 
-Hold the headset Select button, or Y on the right controller, for about a third of a second. The beep means recording has started. Speak, then release. The transcript is typed into the focused window. A short click is left for Steam Input and does not beep.
+Hold the headset Select button for about a third of a second. The beep means recording has started. Speak, then release. The transcript is typed into the focused window. A short click is left for Steam Input and does not beep.
 
-Y is the top face button. Pointer mode leaves it free: the trigger and bumper click, the stick click is right-click, A is home, B is back, and X is middle-click. Left-stick click does not reach whisper on the desktop. The Frame's desktop config is empty, so the virtual gamepad never sees that hold.
+Hold the mic at the bottom-right of a floating window to dictate immediately. Release types into the focused window.
 
 `clear` and `submit` are commands when they are the whole transcript, or the first or last word.
 
@@ -41,7 +41,7 @@ Y is the top face button. Pointer mode leaves it free: the trigger and bumper cl
 `~/.config/whisper-ptt/config` is created on first run.
 
 ```
-button=both
+button=select
 language=en
 threads=4
 append_space=yes
@@ -52,7 +52,7 @@ max_ms=28000
 silence_rms=30
 ```
 
-`button` can be `both`, `select`, `y`, or a gamepad name (`a`, `b`, `x`, `y`, `lb`, `rb`, `view`, `menu`, `guide`, `l3`, `r3`). `both` is Select plus Y. `arm_ms` is how long a hold lasts before the beep. After editing the file:
+`button` is `select`. `both` is accepted and means the same thing. The mic on a floating window does not use this setting. `arm_ms` is how long a Select hold lasts before the beep. After editing the file:
 
 ```sh
 systemctl --user restart whisper-ptt
