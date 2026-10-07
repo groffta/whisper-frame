@@ -37,7 +37,7 @@ Each floating window has a mic at its bottom-right. Hold it to dictate immediate
 
 `clear` and `submit` are commands when they are the whole transcript, or the first or last word.
 
-- `clear` selects the focused field and backspaces it.
+- `clear` backspaces the characters whisper typed into the field.
 - `submit` presses Enter.
 - `clear buy milk submit` clears, types `buy milk`, then presses Enter.
 - A `clear` or `submit` in the middle of the sentence is typed as a normal word.

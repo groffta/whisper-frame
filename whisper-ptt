@@ -8,8 +8,8 @@ starts immediately and types into that window. Controller buttons are
 not triggers.
 
 "clear" and "submit" are actions when they are the whole transcript or
-the first or last word. Clear selects all and backspaces. Submit presses
-Enter. The same word in the middle is typed.
+the first or last word. Clear backspaces the characters whisper typed.
+Submit presses Enter. The same word in the middle is typed.
 
 Config: ~/.config/whisper-ptt/config
 """
@@ -606,6 +606,9 @@ class Typer:
         self.displays = {}
         self.maps = {}
         self.tokens = {}
+        # Characters actually injected, in order. Clear sends one
+        # backspace per entry. Submit drops the buffer: Enter committed it.
+        self.sent = []
 
     def _io_error(self, _display):
         # Xlib requires this handler not to return. A dead socket would
@@ -709,6 +712,7 @@ class Typer:
             self.x11.XFlush(dpy)
             if level == 1 and shift:
                 self._key(dpy, shift[0], False)
+            self.sent.append(char)
             typed += 1
         self.x11.XFlush(dpy)
         return typed
@@ -758,12 +762,25 @@ class Typer:
         if shift:
             self._key(dpy, shift[0], False)
         if name == "clear":
-            selected = self._chord(dpy, table, XK_CONTROL_L, ord("a"))
-            return self._tap(dpy, table, XK_BACKSPACE) and selected
+            return self._backspace_sent(dpy, table)
         if name == "submit":
-            return self._tap(dpy, table, XK_RETURN)
+            ok = self._tap(dpy, table, XK_RETURN)
+            if ok:
+                self.sent.clear()
+            return ok
         log(f"unknown action {name}")
         return False
+
+    def _backspace_sent(self, dpy, table):
+        count = 0
+        while self.sent:
+            if not self._tap(dpy, table, XK_BACKSPACE):
+                log(f"clear stopped after {count} backspaces, {len(self.sent)} left")
+                return False
+            self.sent.pop()
+            count += 1
+        log(f"clear {count} backspaces")
+        return True
 
     def _key(self, dpy, keycode, down):
         self.xtst.XTestFakeKeyEvent(dpy, keycode, 1 if down else 0, 12)
