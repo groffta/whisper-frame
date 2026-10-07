@@ -597,17 +597,39 @@ class Typer:
         ]
         self._handler = ctypes_error_handler()(lambda *_: 0)
         self.x11.XSetErrorHandler(self._handler)
+        self.x11.XSetIOErrorHandler.argtypes = [
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p),
+        ]
+        self.x11.XSetIOErrorHandler.restype = ctypes.c_void_p
+        self._io_handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(self._io_error)
+        self.x11.XSetIOErrorHandler(self._io_handler)
         self.displays = {}
         self.maps = {}
+        self.tokens = {}
+
+    def _io_error(self, _display):
+        # Xlib requires this handler not to return. A dead socket would
+        # otherwise abort inside XFlush and skip the service restart.
+        log("display connection closed")
+        os._exit(1)
+        return 0
 
     def display(self, name):
+        token = x_socket_token(name)
         cached = self.displays.get(name)
-        if cached:
+        if cached and token is not None and self.tokens.get(name) == token:
             return cached
+        if cached:
+            # The server was replaced. Closing the old pointer calls back
+            # into the dead socket, so drop it and open the new one.
+            log(f"display {name} restarted")
+            self.displays.pop(name, None)
+            self.maps.pop(name, None)
         opened = self.x11.XOpenDisplay(name.encode())
         if not opened:
             raise OSError(f"cannot open {name}")
         self.displays[name] = opened
+        self.tokens[name] = token
         return opened
 
     def keymap(self, name):
@@ -853,6 +875,18 @@ def root_window(display):
     if not match:
         raise OSError(f"no root window on {display}")
     return int(match.group(1), 16)
+
+
+def x_socket_token(name):
+    """Identity of the X server socket. A new inode means the server restarted."""
+    if not name.startswith(":"):
+        return None
+    path = f"/tmp/.X11-unix/X{name[1:]}"
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def gamescope_window():
@@ -1131,6 +1165,8 @@ class PanelControl:
             data = conn.recv(512)
         except BlockingIOError:
             return False
+        except OSError:
+            data = b""
         if not data:
             held = conn is self.holder and self.owner
             self._drop(conn)

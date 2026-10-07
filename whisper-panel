@@ -83,6 +83,18 @@ def log(msg):
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
+def steamvr_ipc():
+    """Names of the live SteamVR IPC files. A new name means the runtime restarted."""
+    names = []
+    try:
+        for path in Path("/tmp").iterdir():
+            if path.name.startswith("SteamVR-IPCControlFile-"):
+                names.append(path.name)
+    except OSError:
+        return ()
+    return tuple(sorted(names))
+
+
 def control_path():
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return Path(runtime) / "whisper-ptt.sock"
@@ -789,12 +801,19 @@ class Panel:
             f"whisper panel ready, mic {BUTTON_METERS:.3f}x{height_m:.3f}m, "
             f"{RIGHT_INSET:.2f}m in from the right, {BELOW:.2f}m below"
         )
+        runtime = steamvr_ipc()
         next_scan = 0.0
         windows = []
         while True:
             self.wait_frame(30)
             now = time.monotonic()
             if now >= next_scan:
+                current = steamvr_ipc()
+                if current and runtime and current != runtime:
+                    log("SteamVR restarted, reconnecting")
+                    os._exit(1)
+                if current and not runtime:
+                    runtime = current
                 windows = self.scan_windows()
                 next_scan = now + 1.5
                 self.retire({seq for seq, _ in windows})
