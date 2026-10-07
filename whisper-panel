@@ -36,10 +36,12 @@ SORT_WITH_NON_SCENE = 1 << 14
 # Overlay width. Height follows the texture, a rounded rectangle about
 # three quarters as tall, so the button is half the old 0.11 m disc.
 BUTTON_METERS = 0.055
-# Center of the button. One centimeter left of a flush right edge, and
+# Center of the button. Two centimeters left of a flush right edge, and
 # this far down from the window's bottom edge.
-RIGHT_INSET = BUTTON_METERS / 2 + 0.01
-BELOW = 0.04
+RIGHT_INSET = BUTTON_METERS / 2 + 0.02
+BELOW = 0.03
+# Meters toward the viewer along the anchor Z axis. That axis points at
+# the viewer; an earlier minus sign pushed the button into the glass.
 TOWARD_VIEWER = 0.02
 SCAN_MAX = 4096
 SCENE_HOST = ("127.0.0.1", 27062)
@@ -89,6 +91,7 @@ class WindowScale:
         self._lock = threading.Lock()
         self._wanted = set()
         self._factor = {}
+        self._pose = {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -99,6 +102,11 @@ class WindowScale:
     def factor(self, seq):
         with self._lock:
             return self._factor.get(seq, (1.0, 1.0))
+
+    def pose(self, seq):
+        """Bottom-right corner of the window, already bent by curvature."""
+        with self._lock:
+            return self._pose.get(seq)
 
     def _run(self):
         while True:
@@ -137,20 +145,23 @@ class WindowScale:
                 with self._lock:
                     wanted = list(self._wanted)
                 for seq in wanted:
-                    panel = f"system.standalone::gamescope.gamescope-0.window.{seq}_Panel"
-                    body = {
-                        "type": "transform_request",
-                        "id": panel,
-                        "flPushDistance": 0,
-                        "timeoutSec": 0.05,
-                        "returnAddress": name,
-                        "message_id": message_id,
-                    }
-                    self._send(sock, "mailbox_send vrcompositor_systemlayer " + json.dumps(body))
-                    message_id += 1
+                    base = f"system.standalone::gamescope.gamescope-0.window.{seq}"
+                    # The panel scale tracks resize. The bottom-right anchor is
+                    # the same corner after the dashboard bends the window.
+                    for suffix in ("_Panel", "_BottomRight"):
+                        body = {
+                            "type": "transform_request",
+                            "id": base + suffix,
+                            "flPushDistance": 0,
+                            "timeoutSec": 0.05,
+                            "returnAddress": name,
+                            "message_id": message_id,
+                        }
+                        self._send(sock, "mailbox_send vrcompositor_systemlayer " + json.dumps(body))
+                        message_id += 1
                 got = 0
                 deadline = started + 0.04
-                while got < len(wanted) and time.monotonic() < deadline:
+                while got < len(wanted) * 2 and time.monotonic() < deadline:
                     frame = self._frame(sock)
                     if frame is None:
                         break
@@ -178,14 +189,31 @@ class WindowScale:
         ident = str(data.get("id") or "")
         seq = None
         marker = "gamescope.gamescope-0.window."
-        if marker in ident and ident.endswith("_Panel"):
+        if marker in ident:
             try:
                 seq = int(ident.split(marker, 1)[1].split("_", 1)[0])
             except ValueError:
                 seq = None
-        scale = (data.get("transform") or {}).get("scale") or {}
+        if seq is None:
+            return True
+        transform = data.get("transform") or {}
+        if ident.endswith("_BottomRight"):
+            translation = transform.get("translation") or {}
+            rotation = transform.get("rotation") or {}
+            fields = (
+                translation.get("x"), translation.get("y"), translation.get("z"),
+                rotation.get("x"), rotation.get("y"), rotation.get("z"), rotation.get("w"),
+            )
+            if any(value is None for value in fields):
+                return True
+            with self._lock:
+                self._pose[seq] = fields
+            return True
+        if not ident.endswith("_Panel"):
+            return True
+        scale = transform.get("scale") or {}
         sx, sy, sz = scale.get("x"), scale.get("y"), scale.get("z")
-        if seq is None or not sz or sz < 0.05 or not sx or not sy:
+        if not sz or sz < 0.05 or not sx or not sy:
             return True
         factor = (sx / sz, sy / sz)
         with self._lock:
@@ -293,6 +321,29 @@ def load_openvr():
 def fn(fns, name, restype, *argtypes):
     call = ctypes.CFUNCTYPE(restype, *argtypes)(fns[FN[name]])
     return call
+
+
+def quat_basis(qx, qy, qz, qw):
+    """Local axes of a SteamVR quaternion, as (right, up, z).
+
+    On a window anchor, z points toward the viewer.
+    """
+    right = (
+        1 - 2 * (qy * qy + qz * qz),
+        2 * (qx * qy + qz * qw),
+        2 * (qx * qz - qy * qw),
+    )
+    up = (
+        2 * (qx * qy - qz * qw),
+        1 - 2 * (qx * qx + qz * qz),
+        2 * (qy * qz + qx * qw),
+    )
+    away = (
+        2 * (qx * qz + qy * qw),
+        2 * (qy * qz - qx * qw),
+        1 - 2 * (qx * qx + qy * qy),
+    )
+    return right, up, away
 
 
 def _coverage(dist):
@@ -471,6 +522,9 @@ class Panel:
         return mat
 
     def place(self, button, parent):
+        pose = self.scales.pose(button.seq)
+        if pose is not None:
+            return self.place_on_corner(button, pose)
         mouse = Vec2()
         if self.get_mouse_scale(parent, ctypes.byref(mouse)) != 0 or mouse.x < 2:
             return False
@@ -494,8 +548,8 @@ class Panel:
             return False
         right_u = [c / width for c in right_vec]
         up_u = [c / height for c in up_vec]
-        # Right × up points out the back of the glass. Toward the viewer is the opposite.
-        away = (
+        # Right × up is the overlay Z axis. On these windows it points toward the viewer.
+        facing = (
             right_u[1] * up_u[2] - right_u[2] * up_u[1],
             right_u[2] * up_u[0] - right_u[0] * up_u[2],
             right_u[0] * up_u[1] - right_u[1] * up_u[0],
@@ -509,11 +563,11 @@ class Panel:
                 center[row]
                 + right_u[row] * (width * fx / 2 - inset)
                 - up_u[row] * (height * fy / 2 + BELOW)
-                - away[row] * TOWARD_VIEWER
+                + facing[row] * TOWARD_VIEWER
             )
             spot.m[row * 4 + 0] = right_u[row]
             spot.m[row * 4 + 1] = up_u[row]
-            spot.m[row * 4 + 2] = away[row]
+            spot.m[row * 4 + 2] = facing[row]
         signature = (round(width * fx, 3), round(height * fy, 3))
         if button.placed != signature:
             log(
@@ -521,6 +575,27 @@ class Panel:
                 f"mic {inset:.2f}m in from the right edge"
             )
             button.placed = signature
+        rc = self.set_absolute(button.handle, STANDING, ctypes.byref(spot))
+        return rc == 0
+
+    def place_on_corner(self, button, pose):
+        tx, ty, tz, qx, qy, qz, qw = pose
+        right, up, facing = quat_basis(qx, qy, qz, qw)
+        origin = (tx, ty, tz)
+        spot = Mat()
+        for row in range(3):
+            spot.m[row * 4 + 0] = right[row]
+            spot.m[row * 4 + 1] = up[row]
+            spot.m[row * 4 + 2] = facing[row]
+            spot.m[3 + 4 * row] = (
+                origin[row]
+                - right[row] * RIGHT_INSET
+                - up[row] * BELOW
+                + facing[row] * TOWARD_VIEWER
+            )
+        if button.placed != "corner":
+            log(f"window {button.seq} mic on the window corner")
+            button.placed = "corner"
         rc = self.set_absolute(button.handle, STANDING, ctypes.byref(spot))
         return rc == 0
 
