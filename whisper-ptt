@@ -4,7 +4,8 @@
 A short click of the headset Select button is left for Steam Input.
 Hold it until the beep, then speak, then release. The words are typed
 into whatever gamescope has focused. The mic on a floating window
-starts immediately. Controller buttons are not triggers.
+starts immediately and types into that window. Controller buttons are
+not triggers.
 
 "clear" and "submit" are actions when they are the whole transcript or
 the first or last word. Clear selects all and backspaces. Submit presses
@@ -904,6 +905,171 @@ def gamescope_window():
     return int(match.group(1))
 
 
+OPENVR = "/opt/steamvr/bin/linuxarm64/libopenvr_api.so"
+# gamescope moves its keyboard connector when it receives this event for
+# one of its window overlays. It is not in the public OpenVR headers.
+OVERLAY_INPUT_FOCUS = 564
+
+
+def _norm_title(title):
+    title = (title or "").strip()
+    while title and 0x2800 <= ord(title[0]) <= 0x28FF:
+        title = title[1:].lstrip()
+    return title
+
+
+def window_title(xid):
+    if not xid:
+        return ""
+    try:
+        prop = subprocess.check_output(
+            ["xprop", "-display", ":0", "-id", hex(xid), "_NET_WM_NAME"],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if "=" not in prop:
+        return ""
+    raw = prop.split("=", 1)[1].strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        raw = raw[1:-1]
+    return raw
+
+
+def windows_named(title):
+    """X ids whose xwininfo title matches. Empty when the name is missing or the list could not be read."""
+    wanted = _norm_title(title)
+    if not wanted:
+        return []
+    try:
+        out = subprocess.check_output(
+            ["xwininfo", "-display", ":0", "-root", "-children"],
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        match = re.match(r'\s*(0x[0-9a-fA-F]+)\s+"(.*)"\s*:', line)
+        if not match:
+            continue
+        if _norm_title(match.group(2)) == wanted:
+            found.append(int(match.group(1), 16))
+    return found
+
+
+class WindowFocus:
+    """Move gamescope keyboard focus to the floating window a mic is on.
+
+    IVROverlayView.PostOverlayEvent delivers the event to the process that
+    owns that window overlay. gamescope then switches its keyboard connector.
+    """
+
+    def __init__(self):
+        self._lib = None
+        self._find = None
+        self._name = None
+        self._post = None
+        self._u64 = ctypes.c_uint64
+
+    def focus(self, seq):
+        try:
+            return self._focus(seq)
+        except Exception as exc:
+            log(f"focus window {seq} failed ({exc})")
+            lib = self._lib
+            self._lib = None
+            self._find = None
+            self._name = None
+            self._post = None
+            if lib is not None:
+                try:
+                    lib.VR_ShutdownInternal()
+                except Exception:
+                    pass
+            return False
+
+    def _open(self):
+        if self._post is not None:
+            return True
+        if not Path(OPENVR).exists():
+            log("focus unavailable")
+            return False
+        lib = ctypes.CDLL(OPENVR)
+        err = ctypes.c_int(0)
+        lib.VR_InitInternal.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        lib.VR_InitInternal.restype = ctypes.c_uint32
+        lib.VR_InitInternal(ctypes.byref(err), 2)
+        if err.value != 0:
+            log(f"OpenVR init failed ({err.value})")
+            return False
+        lib.VR_ShutdownInternal.argtypes = []
+        lib.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        lib.VR_GetGenericInterface.restype = ctypes.c_void_p
+        err = ctypes.c_int(0)
+        table = lib.VR_GetGenericInterface(b"FnTable:IVROverlay_028", ctypes.byref(err))
+        if err.value or not table:
+            lib.VR_ShutdownInternal()
+            log(f"overlay interface failed ({err.value})")
+            return False
+        err = ctypes.c_int(0)
+        view = lib.VR_GetGenericInterface(b"FnTable:IVROverlayView_003", ctypes.byref(err))
+        if err.value or not view:
+            lib.VR_ShutdownInternal()
+            log(f"overlay view interface failed ({err.value})")
+            return False
+        fns = ctypes.cast(table, ctypes.POINTER(ctypes.c_void_p))
+        views = ctypes.cast(view, ctypes.POINTER(ctypes.c_void_p))
+        u64 = self._u64
+        self._find = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.POINTER(u64))(fns[0])
+        self._name = ctypes.CFUNCTYPE(
+            ctypes.c_int, u64, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
+        )(fns[5])
+        self._post = ctypes.CFUNCTYPE(None, u64, ctypes.c_void_p)(views[2])
+        self._lib = lib
+        return True
+
+    def _focus(self, seq):
+        if not self._open():
+            return False
+        key = f"gamescope.gamescope-0.window.{seq}".encode()
+        handle = self._u64(0)
+        if self._find(key, ctypes.byref(handle)) != 0 or not handle.value:
+            log(f"focus window {seq} is gone")
+            return False
+        buf = ctypes.create_string_buffer(512)
+        nerr = ctypes.c_int(0)
+        self._name(handle, buf, 512, ctypes.byref(nerr))
+        title = _norm_title(buf.value.decode("utf-8", "replace"))
+        before = gamescope_window()
+        named = windows_named(title)
+        if len(named) == 1 and named[0] == before:
+            log(f"focus window {seq} already")
+            return True
+        event = bytearray(128)
+        event[0:4] = OVERLAY_INPUT_FOCUS.to_bytes(4, "little")
+        event[12:20] = int(handle.value).to_bytes(8, "little")
+        event[20:24] = (1).to_bytes(4, "little")
+        raw = (ctypes.c_char * len(event)).from_buffer(event)
+        self._post(handle, raw)
+        deadline = time.monotonic() + 0.35
+        while time.monotonic() < deadline:
+            now = gamescope_window()
+            if now and now != before:
+                log(f"focus window {seq}")
+                return True
+            time.sleep(0.02)
+        named = windows_named(title)
+        if len(named) == 1 and named[0] == gamescope_window():
+            log(f"focus window {seq} already")
+            return True
+        log(f"focus window {seq} stayed on {before:#x}")
+        return False
+
+
 # --- evdev ------------------------------------------------------------------
 
 def device_name(node):
@@ -978,16 +1144,27 @@ def read_keys(fd):
 # --- record / speak ---------------------------------------------------------
 
 class Talker:
-    def __init__(self, cfg, beeper, typer):
+    def __init__(self, cfg, beeper, typer, focus):
         self.cfg = cfg
         self.beeper = beeper
         self.typer = typer
+        self.focus = focus
         self.proc = None
         self.started = 0.0
+        self.window_seq = None
         self.wav = STATE / "take.wav"
         self.busy = False
+        self.phase = "idle"
+        self.phase_fn = None
 
-    def start(self):
+    def _phase(self, phase):
+        if phase == self.phase:
+            return
+        self.phase = phase
+        if self.phase_fn:
+            self.phase_fn(phase)
+
+    def start(self, window_seq=None):
         if self.proc or self.busy:
             return
         if self.wav.exists():
@@ -1011,13 +1188,17 @@ class Talker:
             stderr=subprocess.DEVNULL,
         )
         self.started = time.monotonic()
+        self.window_seq = window_seq
         self.beeper.begin()
         self.beeper.cue("start")
         log("recording")
+        self._phase("record")
 
     def stop(self, discard=False):
         proc = self.proc
         self.proc = None
+        seq = self.window_seq
+        self.window_seq = None
         if not proc:
             return
         proc.send_signal(signal.SIGINT)
@@ -1029,11 +1210,13 @@ class Talker:
         if discard:
             log("discard short press")
             self.beeper.end()
+            self._phase("idle")
             return
-        self.finish()
+        self.finish(seq)
 
-    def finish(self):
+    def finish(self, window_seq=None):
         self.busy = True
+        self._phase("busy")
         try:
             if not self.wav.exists():
                 log("no wav")
@@ -1057,6 +1240,8 @@ class Talker:
                 self.beeper.cue("empty")
                 return
             (STATE / "last.txt").write_text(text + "\n")
+            if window_seq is not None:
+                self.focus.focus(window_seq)
             deliver(self.typer, text, self.cfg)
             self.beeper.cue("done")
         except Exception as exc:
@@ -1065,6 +1250,7 @@ class Talker:
         finally:
             self.beeper.end()
             self.busy = False
+            self._phase("idle")
 
     def recording(self):
         return self.proc is not None
@@ -1102,9 +1288,16 @@ def control_path():
 class PanelControl:
     """Unix socket the floating-window mic panel uses to hold and release.
 
-    A line is "hold" or "release". Hold starts recording immediately.
-    The headset button still has to pass arm_ms, and it does not steal
-    a take the panel already owns.
+    A line is "hold", "hold <seq>", or "release". Hold starts recording
+    immediately. A seq is the gamescope window the mic sits on, and the
+    transcript is typed into that window. A hold with no seq, which is
+    every hardware take, types into whatever is already focused. The
+    headset button still has to pass arm_ms, and it does not steal a
+    take the panel already owns.
+
+    The daemon also writes "state idle", "state record", or "state busy"
+    whenever a take changes, including one started with Select. Every
+    connected panel follows that.
     """
 
     def __init__(self):
@@ -1120,6 +1313,7 @@ class PanelControl:
         self.clients = {}
         self.owner = False
         self.holder = None
+        self.phase = "idle"
         log(f"panel socket {path}")
 
     def sockets(self):
@@ -1149,6 +1343,15 @@ class PanelControl:
         except OSError:
             self._drop(conn)
 
+    def broadcast(self, line):
+        data = (line + "\n").encode()
+        for conn in list(self.clients):
+            self._send(conn, data)
+
+    def publish(self, phase):
+        self.phase = phase
+        self.broadcast(f"state {phase}")
+
     def accept_ready(self):
         while True:
             try:
@@ -1157,6 +1360,7 @@ class PanelControl:
                 return
             conn.setblocking(False)
             self.clients[conn] = bytearray()
+            self._send(conn, f"state {self.phase}\n".encode())
 
     def read_ready(self, conn, talker):
         """Return True when this client released a panel take by hanging up."""
@@ -1185,14 +1389,21 @@ class PanelControl:
         return False
 
     def _command(self, conn, line, talker):
-        if line == "hold":
+        parts = line.split()
+        if parts[:1] == ["hold"] and len(parts) <= 2:
+            seq = None
+            if len(parts) == 2:
+                if not parts[1].isdigit():
+                    self._send(conn, b"no\n")
+                    return
+                seq = int(parts[1])
             if self.owner or talker.recording() or talker.busy:
                 self._send(conn, b"busy\n")
                 return
             self.owner = True
             self.holder = conn
-            talker.start()
-            log("panel hold")
+            talker.start(seq)
+            log(f"panel hold {seq}" if seq is not None else "panel hold")
             self._send(conn, b"ok\n")
             return
         if line == "release":
@@ -1220,7 +1431,7 @@ def run_daemon():
     ensure_cues()
     typer = Typer()
     beeper = Beeper()
-    talker = Talker(cfg, beeper, typer)
+    talker = Talker(cfg, beeper, typer, WindowFocus())
     log(
         f"whisper small ready, button={cfg['button']}, "
         f"lang={cfg['language']}, threads={cfg['threads']}, gpu=vulkan, "
@@ -1233,6 +1444,7 @@ def run_daemon():
     starter = None
     signature = None
     panel = PanelControl()
+    talker.phase_fn = panel.publish
 
     def rescan(force=False):
         nonlocal fds, signature, starter, held, pending, pending_at

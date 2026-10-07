@@ -23,11 +23,17 @@ Installed paths:
 - `~/.local/share/whisper/ggml-small-q8_0.bin`
 - `~/.config/systemd/user/whisper-ptt.service`
 
+The 0.1.0 archive is the dictation daemon. It does not include the window mic. Installing from this repository does, when `whisper-panel` and `overlay_point.c` are in the directory: `install.sh` builds `overlay_point.so` with `gcc` and enables `whisper-panel`. That adds:
+
+- `~/.local/bin/whisper-panel`
+- `~/.local/lib/whisper-frame/overlay_point.so`
+- `~/.config/systemd/user/whisper-panel.service`
+
 ## Use
 
 Hold the headset Select button for about a third of a second. The beep means recording has started. Speak, then release. The transcript is typed into the focused window. A short click is left for Steam Input and does not beep.
 
-Hold the mic at the bottom-right of a floating window to dictate immediately. Release types into the focused window.
+Each floating window has a mic at its bottom-right. Hold it to dictate immediately, then release to type into that window. A click shorter than about a third of a second leaves recording running until the next click. While a take is recording, every mic shows a circle. After release they show a spinner until the transcript has been typed. Select drives the same icons.
 
 `clear` and `submit` are commands when they are the whole transcript, or the first or last word.
 
@@ -52,7 +58,7 @@ max_ms=28000
 silence_rms=30
 ```
 
-`button` is `select`. `both` is accepted and means the same thing. The mic on a floating window does not use this setting. `arm_ms` is how long a Select hold lasts before the beep. After editing the file:
+`button` is `select`. `both` means the same thing. A gamepad name (`a`, `b`, `x`, `y`, `lb`, `rb`, `view`, `menu`, `guide`, `l3`, `r3`) still arms that button if you set it. The window mic does not use this setting. `arm_ms` is how long a Select hold lasts before the beep. A shorter Select click stays with Steam Input. After editing the file:
 
 ```sh
 systemctl --user restart whisper-ptt
@@ -62,10 +68,14 @@ systemctl --user restart whisper-ptt
 
 ```sh
 systemctl --user disable --now whisper-ptt
-rm -f ~/.local/bin/whisper-ptt ~/.config/systemd/user/whisper-ptt.service
+systemctl --user disable --now whisper-panel
+rm -f ~/.local/bin/whisper-ptt ~/.local/bin/whisper-panel
+rm -f ~/.config/systemd/user/whisper-ptt.service ~/.config/systemd/user/whisper-panel.service
 rm -rf ~/.local/lib/whisper-frame
 systemctl --user daemon-reload
 ```
+
+Skip the `whisper-panel` lines when that service was never installed.
 
 The model in `~/.local/share/whisper/` is left in place.
 
@@ -81,4 +91,4 @@ That writes `dist/whisper-frame-<version>-aarch64.tar.gz` from the local binarie
 
 ## License
 
-The installer, service, and `whisper-ptt` script are MIT, in `LICENSE`. The bundled `whisper-cli` and ggml libraries are whisper.cpp, also MIT, in `LICENSES/whisper.cpp`.
+The installer, the services, `whisper-ptt`, and `whisper-panel` are MIT, in `LICENSE`. The bundled `whisper-cli` and ggml libraries are whisper.cpp, also MIT, in `LICENSES/whisper.cpp`.

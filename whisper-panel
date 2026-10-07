@@ -3,8 +3,9 @@
 
 The button is our own OpenVR overlay, parked just under the window's
 bottom-right corner, which is where the keyboard button sits on the
-control bar. Hold the trigger on it to dictate. Release types into the
-focused gamescope window. The headset Select button is unchanged.
+control bar. Hold the trigger on it to dictate. Release types into
+that window. Every mic shows a circle while recording and a spinner
+while the transcript is typed, including a take started with Select.
 
 Needs overlay_point.so next to this file or in ~/.local/lib/whisper-frame.
 """
@@ -418,6 +419,48 @@ def _masks():
     return w, h, plate, ink
 
 
+def _circle_ink(w, h, radius):
+    """Filled circle, used as the recording mark."""
+    ink = bytearray(w * h)
+    cx = w / 2
+    cy = h / 2
+    for y in range(h):
+        for x in range(w):
+            dist = math.hypot(x + 0.5 - cx, y + 0.5 - cy) - radius
+            ink[y * w + x] = round(_coverage(dist) * 255)
+    return ink
+
+
+def _spinner_inks(w, h, frames=12, dots=8):
+    """A fading tail of dots. Each frame steps the tail forward."""
+    cx = w / 2
+    cy = h / 2
+    orbit = 18
+    dot_r = 3.4
+    out = []
+    for step in range(frames):
+        ink = bytearray(w * h)
+        for i in range(dots):
+            weight = (dots - i) / dots
+            ang = -math.pi / 2 + (step - i) * (math.tau / frames)
+            dx = cx + math.cos(ang) * orbit
+            dy = cy + math.sin(ang) * orbit
+            x0 = max(0, int(dx - dot_r - 2))
+            x1 = min(w, int(dx + dot_r + 3))
+            y0 = max(0, int(dy - dot_r - 2))
+            y1 = min(h, int(dy + dot_r + 3))
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    dist = math.hypot(x + 0.5 - dx, y + 0.5 - dy) - dot_r
+                    cover = _coverage(dist) * weight
+                    if cover <= 0:
+                        continue
+                    index = y * w + x
+                    ink[index] = max(ink[index], round(cover * 255))
+        out.append(ink)
+    return out
+
+
 def _compose(plate, ink, color):
     w = 150
     buf = bytearray(len(plate) * 4)
@@ -489,7 +532,17 @@ class Panel:
         self.tex_w, self.tex_h, plate, ink = _masks()
         self.idle_px = _compose(plate, ink, IDLE_BG)
         self.hover_px = _compose(plate, ink, HOVER_BG)
-        self.hot_px = _compose(plate, ink, HOT_BG)
+        circle = _circle_ink(self.tex_w, self.tex_h, 16)
+        self.record_px = _compose(plate, circle, HOT_BG)
+        spins = _spinner_inks(self.tex_w, self.tex_h)
+        self.spin_px = [_compose(plate, frame, IDLE_BG) for frame in spins]
+        self.spin_hover_px = [_compose(plate, frame, HOVER_BG) for frame in spins]
+        # idle, record, or busy. The daemon publishes this for every take,
+        # including the headset Select button.
+        self.phase = "idle"
+        self.phase_at = time.monotonic()
+        self.pending_reply = False
+        self.reply = None
         self.buttons = {}
         self.scales = WindowScale()
         self.holding = None
@@ -564,8 +617,16 @@ class Panel:
         self.set_raw(handle, raw, self.tex_w, self.tex_h, 4)
 
     def refresh(self, button):
-        if self.holding is button:
-            face, pixels = "hot", self.hot_px
+        if self.phase == "record":
+            face, pixels = "record", self.record_px
+        elif self.phase == "busy":
+            frame = int((time.monotonic() - self.phase_at) / 0.08) % len(self.spin_px)
+            if button.hovered:
+                face = f"busy-h-{frame}"
+                pixels = self.spin_hover_px[frame]
+            else:
+                face = f"busy-{frame}"
+                pixels = self.spin_px[frame]
         elif button.hovered:
             face, pixels = "hover", self.hover_px
         else:
@@ -706,6 +767,41 @@ class Panel:
         log("connected to whisper-ptt")
         return True
 
+    def drain(self):
+        """Read daemon lines. State lines update every mic."""
+        if self.sock is None:
+            self.connect()
+        if self.sock is None:
+            return
+        while True:
+            while b"\n" in self.buf:
+                raw, _, rest = self.buf.partition(b"\n")
+                self.buf = rest
+                self._take(raw.decode("ascii", "replace").strip())
+            try:
+                data = self.sock.recv(512)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+            if not data:
+                self.sock.close()
+                self.sock = None
+                self.buf = b""
+                return
+            self.buf += data
+
+    def _take(self, line):
+        if line.startswith("state "):
+            phase = line[6:].strip()
+            if phase in ("idle", "record", "busy") and phase != self.phase:
+                self.phase = phase
+                self.phase_at = time.monotonic()
+                log(f"mic {phase}")
+            return
+        if self.pending_reply and self.reply is None and line in ("ok", "busy", "no"):
+            self.reply = line
+
     def send(self, line):
         if not self.connect():
             return None
@@ -715,22 +811,21 @@ class Panel:
             self.sock.close()
             self.sock = None
             return None
+        self.pending_reply = True
+        self.reply = None
         deadline = time.monotonic() + 0.4
         while time.monotonic() < deadline:
-            if b"\n" in self.buf:
-                reply, _, rest = self.buf.partition(b"\n")
-                self.buf = rest
-                return reply.decode("ascii", "replace").strip()
-            try:
-                data = self.sock.recv(128)
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
-            if not data:
-                self.sock.close()
-                self.sock = None
+            self.drain()
+            if self.sock is None:
+                self.pending_reply = False
                 return None
-            self.buf += data
+            if self.reply is not None:
+                reply = self.reply
+                self.reply = None
+                self.pending_reply = False
+                return reply
+            time.sleep(0.01)
+        self.pending_reply = False
         return None
 
     def pointer(self, button):
@@ -764,7 +859,7 @@ class Panel:
                 log("click off")
                 continue
             if event_type == MOUSE_DOWN and self.holding is None:
-                reply = self.send("hold")
+                reply = self.send(f"hold {button.seq}")
                 if reply == "ok":
                     self.holding = button
                     self.pressed_at = time.monotonic()
@@ -807,6 +902,7 @@ class Panel:
         while True:
             self.wait_frame(30)
             now = time.monotonic()
+            self.drain()
             if now >= next_scan:
                 current = steamvr_ipc()
                 if current and runtime and current != runtime:
@@ -823,6 +919,7 @@ class Panel:
                 if button is None:
                     continue
                 button.parent = parent
+                self.refresh(button)
                 if not self.place(button, parent, now):
                     self.hide(button.handle)
                     continue
