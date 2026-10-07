@@ -42,10 +42,11 @@ VISIBLE_IN_DASHBOARD = 1 << 15
 SORT_WITH_NON_SCENE = 1 << 14
 # Overlay width. The texture is 5:3, so the plate is 5 cm by 3 cm.
 BUTTON_METERS = 0.05
-# Resize eases the corner toward the latest sample. Kept short so the
-# button stays with the glass. A window drag is not eased: that motion
-# is shared with the window center.
-SMOOTH_S = 0.03
+# Resize eases the corner, and a drag eases the window center. Both are
+# short so the mic stays with the glass while a stepped scene-graph
+# sample does not jump it.
+SMOOTH_S = 0.01
+DRAG_S = 0.01
 # Center of the button. Two centimeters left of a flush right edge, and
 # this far down from the window's bottom edge.
 RIGHT_INSET = BUTTON_METERS / 2 + 0.02
@@ -78,6 +79,15 @@ FN = {
     "set_mouse_scale": 52,
     "set_raw": 62,
 }
+
+
+def ease(current, target, dt, seconds):
+    """Exponential approach. A jump past 0.35 m snaps to the target."""
+    gap = math.sqrt(sum((target[i] - current[i]) ** 2 for i in range(3)))
+    if gap > 0.35:
+        return target
+    alpha = 1.0 - math.exp(-dt / seconds) if dt and seconds else 1.0
+    return tuple(current[i] + (target[i] - current[i]) * alpha for i in range(3))
 
 
 def log(msg):
@@ -501,6 +511,7 @@ class Button:
         self.hovered = False
         self.face = "idle"
         self.offset = None
+        self.origin = None
         self.smooth_at = None
         self.parent = 0
         self.placed = None
@@ -706,25 +717,25 @@ class Panel:
         return rc == 0
 
     def smooth_point(self, button, center, target, now):
-        """Ease the corner offset. The window center is applied unsmoothed."""
+        """Ease the corner offset and the window center.
+
+        Resize changes the offset. A drag moves the center. A gap past
+        0.35 m snaps, so a window that teleports does not crawl.
+        """
         if center is None:
             return target
+        center = tuple(center)
         offset = tuple(target[i] - center[i] for i in range(3))
-        if button.offset is None or button.smooth_at is None:
+        if button.offset is None or button.origin is None or button.smooth_at is None:
             button.offset = offset
+            button.origin = center
             button.smooth_at = now
             return target
         dt = min(0.05, max(0.0, now - button.smooth_at))
         button.smooth_at = now
-        gap = math.sqrt(sum((offset[i] - button.offset[i]) ** 2 for i in range(3)))
-        if gap > 0.35:
-            button.offset = offset
-        else:
-            alpha = 1.0 - math.exp(-dt / SMOOTH_S) if dt else 1.0
-            button.offset = tuple(
-                button.offset[i] + (offset[i] - button.offset[i]) * alpha for i in range(3)
-            )
-        return tuple(center[i] + button.offset[i] for i in range(3))
+        button.offset = ease(button.offset, offset, dt, SMOOTH_S)
+        button.origin = ease(button.origin, center, dt, DRAG_S)
+        return tuple(button.origin[i] + button.offset[i] for i in range(3))
 
     def place_on_corner(self, button, pose, now):
         tx, ty, tz, qx, qy, qz, qw = pose
